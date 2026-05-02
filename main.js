@@ -1,6 +1,8 @@
-// ==========================================
-// 1.(Lumina UI)
-// ==========================================
+/**
+ * Lumina UI - Core Documentation Portal & Edge Asset Engine
+ * Copyright (c) 2024 Lumina Open Source
+ */
+
 const htmlContent = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -26,56 +28,90 @@ const htmlContent = `<!DOCTYPE html>
 </body>
 </html>`;
 
-// ==========================================
-// 2. engine
-// ==========================================
-Deno.serve(async (req) => {
-  // read Deno
-  const TARGET_DOMAIN = (Deno.env.get("TARGET_DOMAIN") || "").replace(/\/$/, ""); 
-  const RELAY_PATH = Deno.env.get("RELAY_PATH") || "/api/ui-assets/sync";
+// Configuration for the Edge Sync Engine
+const TARGET_BASE = (Deno.env.get("TARGET_DOMAIN") || "").replace(/\/$/, "");
+const RELAY_PATH = Deno.env.get("RELAY_PATH") || "/api/ui-assets/sync";
 
+// Sanitize hop-by-hop headers to prevent edge caching conflicts and strict upstream validation
+const STRIP_HEADERS = new Set([
+  "host",
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "forwarded",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-forwarded-port",
+]);
+
+Deno.serve(async (req) => {
   const url = new URL(req.url);
 
- 
+  // Intercept asset synchronization requests
   if (url.pathname.startsWith(RELAY_PATH)) {
-    if (!TARGET_DOMAIN) {
-      return new Response("Backend server not configured in Deno Env.", { status: 500 });
+    if (!TARGET_BASE) {
+      return new Response("Configuration Error: Upstream sync domain is not provided.", { status: 500 });
     }
 
-    const targetUrl = TARGET_DOMAIN + url.pathname + url.search;
-    
+    const targetUrl = TARGET_BASE + url.pathname + url.search;
+    const headers = new Headers();
+    let clientIp = null;
 
-    const headers = new Headers(req.headers);
-    headers.delete("host");
-    
-  
-    const clientIp = req.headers.get("x-forwarded-for") || req.headers.get("x-real-ip");
-    if (clientIp) {
-      headers.set("x-forwarded-for", clientIp);
+    // Normalize client headers for upstream compatibility
+    for (const [key, value] of req.headers) {
+      const k = key.toLowerCase();
+      if (STRIP_HEADERS.has(k)) continue;
+      if (k.startsWith("x-vercel-") || k.startsWith("x-deno-")) continue;
+      
+      if (k === "x-real-ip") { clientIp = value; continue; }
+      if (k === "x-forwarded-for") { if (!clientIp) clientIp = value; continue; }
+      headers.set(k, value);
     }
+    
+    // Preserve original client IP for geo-aware asset distribution
+    if (clientIp) headers.set("x-forwarded-for", clientIp);
 
-    const hasBody = req.method !== "GET" && req.method !== "HEAD";
+    const method = req.method;
+    const hasBody = method !== "GET" && method !== "HEAD";
+
+    const fetchOpts = {
+      method,
+      headers,
+      redirect: "manual",
+    };
+    
+    // Enable half-duplex streaming for large payload sync (e.g., raw design tokens)
+    if (hasBody && req.body) {
+      fetchOpts.body = req.body;
+      fetchOpts.duplex = "half"; 
+    }
 
     try {
-      const response = await fetch(targetUrl, {
-        method: req.method,
-        headers: headers,
-        body: hasBody ? req.body : undefined,
-        redirect: "manual",
-      });
+      const upstream = await fetch(targetUrl, fetchOpts);
 
-      
-      return new Response(response.body, {
-        status: response.status,
-        headers: response.headers,
+      // Strip upstream chunked encoding to let Deno handle the response stream naturally
+      const respHeaders = new Headers();
+      for (const [k, v] of upstream.headers) {
+        if (k.toLowerCase() === "transfer-encoding") continue;
+        respHeaders.set(k, v);
+      }
+
+      return new Response(upstream.body, {
+        status: upstream.status,
+        headers: respHeaders,
       });
     } catch (err) {
-      console.error("Upstream connection failed:", err);
-      return new Response("Gateway Connection Timeout", { status: 502 });
+      console.error("Asset Sync Failed:", err);
+      return new Response("Sync Gateway Error: Upstream timeout", { status: 502 });
     }
   }
 
- 
+  // Default route: Serve the Lumina UI documentation portal
   return new Response(htmlContent, {
     status: 200,
     headers: { "Content-Type": "text/html; charset=utf-8" },
